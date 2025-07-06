@@ -284,3 +284,95 @@
     "not-found"
   )
 )
+
+(define-constant ERR_INSUFFICIENT_APPROVALS (err u109))
+(define-constant ERR_ALREADY_APPROVED (err u110))
+(define-constant ERR_NOT_AUTHORIZED_SIGNER (err u111))
+(define-constant APPROVAL_THRESHOLD u500000)
+(define-constant REQUIRED_APPROVALS u3)
+
+(define-data-var total-authorized-signers uint u0)
+
+(define-map authorized-signers
+  { signer: principal }
+  { authorized: bool, added-at: uint }
+)
+
+(define-map policy-approvals
+  { policy-id: uint }
+  { 
+    approvals: uint,
+    approved-by: (list 10 principal),
+    requires-approval: bool,
+    fully-approved: bool
+  }
+)
+
+(define-public (add-authorized-signer (signer principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (map-set authorized-signers 
+      { signer: signer } 
+      { authorized: true, added-at: stacks-block-height })
+    (var-set total-authorized-signers (+ (var-get total-authorized-signers) u1))
+    (ok true)
+  )
+)
+
+(define-public (remove-authorized-signer (signer principal))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (map-set authorized-signers 
+      { signer: signer } 
+      { authorized: false, added-at: u0 })
+    (var-set total-authorized-signers (- (var-get total-authorized-signers) u1))
+    (ok true)
+  )
+)
+
+(define-public (approve-policy (policy-id uint))
+  (let
+    (
+      (signer-info (map-get? authorized-signers { signer: tx-sender }))
+      (policy-approval (default-to 
+        { approvals: u0, approved-by: (list), requires-approval: false, fully-approved: false }
+        (map-get? policy-approvals { policy-id: policy-id })))
+      (already-approved (is-some (index-of (get approved-by policy-approval) tx-sender)))
+    )
+    (asserts! (is-some signer-info) ERR_NOT_AUTHORIZED_SIGNER)
+    (asserts! (get authorized (unwrap-panic signer-info)) ERR_NOT_AUTHORIZED_SIGNER)
+    (asserts! (not already-approved) ERR_ALREADY_APPROVED)
+    (asserts! (get requires-approval policy-approval) ERR_POLICY_NOT_FOUND)
+    
+    (let
+      (
+        (new-approvals (+ (get approvals policy-approval) u1))
+        (new-approved-by (unwrap-panic (as-max-len? 
+          (append (get approved-by policy-approval) tx-sender) u10)))
+        (is-fully-approved (>= new-approvals REQUIRED_APPROVALS))
+      )
+      (map-set policy-approvals
+        { policy-id: policy-id }
+        {
+          approvals: new-approvals,
+          approved-by: new-approved-by,
+          requires-approval: true,
+          fully-approved: is-fully-approved
+        }
+      )
+      (ok is-fully-approved)
+    )
+  )
+)
+
+(define-read-only (get-policy-approvals (policy-id uint))
+  (map-get? policy-approvals { policy-id: policy-id })
+)
+
+(define-read-only (is-signer-authorized (signer principal))
+  (default-to false (get authorized (map-get? authorized-signers { signer: signer })))
+)
+
+(define-read-only (policy-needs-approval (coverage-amount uint))
+  (>= coverage-amount APPROVAL_THRESHOLD)
+)
