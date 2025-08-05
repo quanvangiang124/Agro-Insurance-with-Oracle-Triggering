@@ -9,6 +9,12 @@
 (define-constant ERR_INSUFFICIENT_POOL_FUNDS (err u107))
 (define-constant ERR_ORACLE_NOT_AUTHORIZED (err u108))
 
+(define-constant ERR_INVALID_RISK_DATA (err u112))
+(define-constant ERR_RISK_CALCULATION_FAILED (err u113))
+(define-constant MAX_RISK_SCORE u1000)
+(define-constant BASE_RISK_SCORE u500)
+(define-constant RISK_ADJUSTMENT_FACTOR u50)
+
 (define-data-var next-policy-id uint u1)
 (define-data-var insurance-pool uint u0)
 (define-data-var oracle-address principal tx-sender)
@@ -375,4 +381,105 @@
 
 (define-read-only (policy-needs-approval (coverage-amount uint))
   (>= coverage-amount APPROVAL_THRESHOLD)
+)
+
+
+(define-map regional-risk-data
+  { location: (string-ascii 100) }
+  {
+    total-policies: uint,
+    successful-claims: uint,
+    weather-volatility: uint,
+    last-updated: uint,
+    risk-score: uint
+  }
+)
+
+(define-map historical-weather-patterns
+  { location: (string-ascii 100), season: uint }
+  {
+    avg-rainfall: uint,
+    avg-temperature: uint,
+    volatility-index: uint,
+    data-points: uint
+  }
+)
+
+(define-public (update-regional-risk 
+  (location (string-ascii 100))
+  (claim-success bool)
+  (weather-volatility uint)
+)
+  (let
+    (
+      (current-data (default-to 
+        { total-policies: u0, successful-claims: u0, weather-volatility: u0, 
+          last-updated: u0, risk-score: BASE_RISK_SCORE }
+        (map-get? regional-risk-data { location: location })))
+      (new-total (+ (get total-policies current-data) u1))
+      (new-claims (if claim-success 
+        (+ (get successful-claims current-data) u1)
+        (get successful-claims current-data)))
+      (calculated-risk (calculate-risk-score new-total new-claims weather-volatility))
+    )
+    (map-set regional-risk-data
+      { location: location }
+      {
+        total-policies: new-total,
+        successful-claims: new-claims,
+        weather-volatility: weather-volatility,
+        last-updated: stacks-block-height,
+        risk-score: calculated-risk
+      }
+    )
+    (ok calculated-risk)
+  )
+)
+
+(define-private (calculate-risk-score 
+  (total-policies uint)
+  (successful-claims uint)
+  (weather-volatility uint)
+)
+  (if (is-eq total-policies u0)
+    BASE_RISK_SCORE
+    (let
+      (
+        (claim-rate (/ (* successful-claims u100) total-policies))
+        (volatility-factor (/ (* weather-volatility RISK_ADJUSTMENT_FACTOR) u100))
+        (base-adjustment (if (> claim-rate u20) 
+          (+ BASE_RISK_SCORE (* (- claim-rate u20) u10))
+          (- BASE_RISK_SCORE (* (- u20 claim-rate) u5))))
+        (final-risk (+ base-adjustment volatility-factor))
+      )
+      (if (> final-risk MAX_RISK_SCORE) MAX_RISK_SCORE final-risk)
+    )
+  )
+)
+
+(define-public (calculate-dynamic-premium 
+  (coverage-amount uint)
+  (location (string-ascii 100))
+)
+  (let
+    (
+      (risk-data (map-get? regional-risk-data { location: location }))
+      (risk-score (match risk-data
+        data (get risk-score data)
+        BASE_RISK_SCORE))
+      (base-premium (/ (* coverage-amount u10) u100))
+      (risk-multiplier (/ risk-score u100))
+      (adjusted-premium (/ (* base-premium risk-multiplier) u5))
+    )
+    (ok adjusted-premium)
+  )
+)
+
+(define-read-only (get-regional-risk (location (string-ascii 100)))
+  (map-get? regional-risk-data { location: location })
+)
+
+(define-read-only (get-location-risk-score (location (string-ascii 100)))
+  (default-to BASE_RISK_SCORE 
+    (get risk-score (map-get? regional-risk-data { location: location })))
 )
