@@ -15,6 +15,12 @@
 (define-constant BASE_RISK_SCORE u500)
 (define-constant RISK_ADJUSTMENT_FACTOR u50)
 
+(define-constant MAX_REPUTATION_SCORE u1000)
+(define-constant BASE_REPUTATION_SCORE u500)
+(define-constant LOYALTY_TIER_BRONZE u300)
+(define-constant LOYALTY_TIER_SILVER u600)
+(define-constant LOYALTY_TIER_GOLD u800)
+
 (define-data-var next-policy-id uint u1)
 (define-data-var insurance-pool uint u0)
 (define-data-var oracle-address principal tx-sender)
@@ -482,4 +488,116 @@
 (define-read-only (get-location-risk-score (location (string-ascii 100)))
   (default-to BASE_RISK_SCORE 
     (get risk-score (map-get? regional-risk-data { location: location })))
+)
+
+
+(define-map farmer-reputation
+  { farmer: principal }
+  {
+    total-policies: uint,
+    valid-claims: uint,
+    fraudulent-claims: uint,
+    reputation-score: uint,
+    loyalty-tier: uint,
+    join-block: uint,
+    last-updated: uint
+  }
+)
+
+(define-map loyalty-benefits
+  { tier: uint }
+  {
+    discount-percentage: uint,
+    max-coverage-multiplier: uint,
+    priority-processing: bool
+  }
+)
+
+(define-private (initialize-loyalty-tiers)
+  (begin
+    (map-set loyalty-benefits { tier: u0 } 
+      { discount-percentage: u0, max-coverage-multiplier: u100, priority-processing: false })
+    (map-set loyalty-benefits { tier: u1 } 
+      { discount-percentage: u5, max-coverage-multiplier: u120, priority-processing: false })
+    (map-set loyalty-benefits { tier: u2 } 
+      { discount-percentage: u10, max-coverage-multiplier: u150, priority-processing: true })
+    (map-set loyalty-benefits { tier: u3 } 
+      { discount-percentage: u15, max-coverage-multiplier: u200, priority-processing: true })
+  )
+)
+
+(define-public (update-farmer-reputation (farmer principal) (claim-valid bool))
+  (let
+    (
+      (current-rep (default-to 
+        { total-policies: u0, valid-claims: u0, fraudulent-claims: u0, 
+          reputation-score: BASE_REPUTATION_SCORE, loyalty-tier: u0, 
+          join-block: stacks-block-height, last-updated: u0 }
+        (map-get? farmer-reputation { farmer: farmer })))
+      (new-policies (+ (get total-policies current-rep) u1))
+      (new-valid (if claim-valid (+ (get valid-claims current-rep) u1) (get valid-claims current-rep)))
+      (new-fraud (if claim-valid (get fraudulent-claims current-rep) (+ (get fraudulent-claims current-rep) u1)))
+      (calculated-score (calculate-reputation-score new-policies new-valid new-fraud))
+      (new-tier (determine-loyalty-tier calculated-score))
+    )
+    (map-set farmer-reputation
+      { farmer: farmer }
+      {
+        total-policies: new-policies,
+        valid-claims: new-valid,
+        fraudulent-claims: new-fraud,
+        reputation-score: calculated-score,
+        loyalty-tier: new-tier,
+        join-block: (get join-block current-rep),
+        last-updated: stacks-block-height
+      }
+    )
+    (ok calculated-score)
+  )
+)
+
+(define-private (calculate-reputation-score (total uint) (valid uint) (fraud uint))
+  (if (is-eq total u0)
+    BASE_REPUTATION_SCORE
+    (let
+      (
+        (success-rate (/ (* valid u100) total))
+        (fraud-penalty (* fraud u50))
+        (base-score (+ BASE_REPUTATION_SCORE (* (- success-rate u50) u5)))
+        (final-score (if (>= base-score fraud-penalty) (- base-score fraud-penalty) u0))
+      )
+      (if (> final-score MAX_REPUTATION_SCORE) MAX_REPUTATION_SCORE final-score)
+    )
+  )
+)
+
+(define-private (determine-loyalty-tier (reputation-score uint))
+  (if (>= reputation-score LOYALTY_TIER_GOLD) u3
+    (if (>= reputation-score LOYALTY_TIER_SILVER) u2
+      (if (>= reputation-score LOYALTY_TIER_BRONZE) u1 u0)
+    )
+  )
+)
+
+(define-public (calculate-loyalty-premium (base-premium uint) (farmer principal))
+  (let
+    (
+      (rep-data (map-get? farmer-reputation { farmer: farmer }))
+      (tier (match rep-data data (get loyalty-tier data) u0))
+      (benefits (default-to 
+        { discount-percentage: u0, max-coverage-multiplier: u100, priority-processing: false }
+        (map-get? loyalty-benefits { tier: tier })))
+      (discount (get discount-percentage benefits))
+      (discounted-premium (- base-premium (/ (* base-premium discount) u100)))
+    )
+    (ok discounted-premium)
+  )
+)
+
+(define-read-only (get-farmer-reputation (farmer principal))
+  (map-get? farmer-reputation { farmer: farmer })
+)
+
+(define-read-only (get-loyalty-tier-benefits (tier uint))
+  (map-get? loyalty-benefits { tier: tier })
 )
