@@ -21,6 +21,11 @@
 (define-constant LOYALTY_TIER_SILVER u600)
 (define-constant LOYALTY_TIER_GOLD u800)
 
+(define-constant ERR_INVALID_YIELD_DATA (err u114))
+(define-constant ERR_YIELD_THRESHOLD_NOT_MET (err u115))
+(define-constant MIN_YIELD_THRESHOLD u50)
+(define-constant MAX_YIELD_THRESHOLD u95)
+
 (define-data-var next-policy-id uint u1)
 (define-data-var insurance-pool uint u0)
 (define-data-var oracle-address principal tx-sender)
@@ -600,4 +605,156 @@
 
 (define-read-only (get-loyalty-tier-benefits (tier uint))
   (map-get? loyalty-benefits { tier: tier })
+)
+
+
+(define-map regional-yield-index
+  { location: (string-ascii 100), crop-type: (string-ascii 50), season: uint }
+  {
+    historical-avg-yield: uint,
+    current-yield: uint,
+    yield-variance: uint,
+    data-points-collected: uint,
+    last-updated: uint
+  }
+)
+
+(define-map yield-based-policies
+  { policy-id: uint }
+  {
+    yield-threshold-percent: uint,
+    baseline-yield: uint,
+    season: uint,
+    yield-verified: bool
+  }
+)
+
+(define-public (submit-regional-yield 
+  (location (string-ascii 100))
+  (crop-type (string-ascii 50))
+  (season uint)
+  (yield-value uint)
+)
+  (let
+    (
+      (oracle-auth (default-to { authorized: false } 
+        (map-get? authorized-oracles { oracle: tx-sender })))
+      (existing-data (map-get? regional-yield-index 
+        { location: location, crop-type: crop-type, season: season }))
+    )
+    (asserts! (get authorized oracle-auth) ERR_ORACLE_NOT_AUTHORIZED)
+    (asserts! (> yield-value u0) ERR_INVALID_YIELD_DATA)
+    
+    (match existing-data
+      current-index
+        (let
+          (
+            (total-points (get data-points-collected current-index))
+            (old-avg (get historical-avg-yield current-index))
+            (new-avg (/ (+ (* old-avg total-points) yield-value) (+ total-points u1)))
+            (variance (if (> yield-value new-avg) (- yield-value new-avg) (- new-avg yield-value)))
+          )
+          (map-set regional-yield-index
+            { location: location, crop-type: crop-type, season: season }
+            {
+              historical-avg-yield: new-avg,
+              current-yield: yield-value,
+              yield-variance: variance,
+              data-points-collected: (+ total-points u1),
+              last-updated: stacks-block-height
+            }
+          )
+          (ok new-avg)
+        )
+      (begin
+        (map-set regional-yield-index
+          { location: location, crop-type: crop-type, season: season }
+          {
+            historical-avg-yield: yield-value,
+            current-yield: yield-value,
+            yield-variance: u0,
+            data-points-collected: u1,
+            last-updated: stacks-block-height
+          }
+        )
+        (ok yield-value)
+      )
+    )
+  )
+)
+
+(define-public (attach-yield-protection 
+  (policy-id uint)
+  (yield-threshold-percent uint)
+  (season uint)
+)
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) ERR_POLICY_NOT_FOUND))
+      (yield-data (map-get? regional-yield-index 
+        { location: (get location policy), crop-type: (get crop-type policy), season: season }))
+    )
+    (asserts! (is-eq (get farmer policy) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (and (>= yield-threshold-percent MIN_YIELD_THRESHOLD) 
+                   (<= yield-threshold-percent MAX_YIELD_THRESHOLD)) ERR_INVALID_YIELD_DATA)
+    (asserts! (is-some yield-data) ERR_INVALID_YIELD_DATA)
+    
+    (map-set yield-based-policies
+      { policy-id: policy-id }
+      {
+        yield-threshold-percent: yield-threshold-percent,
+        baseline-yield: (get historical-avg-yield (unwrap-panic yield-data)),
+        season: season,
+        yield-verified: false
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (check-yield-claim-eligibility (policy-id uint))
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) (err false)))
+      (yield-policy (unwrap! (map-get? yield-based-policies { policy-id: policy-id }) (err false)))
+      (yield-data (unwrap! (map-get? regional-yield-index 
+        { location: (get location policy), crop-type: (get crop-type policy), 
+          season: (get season yield-policy) }) (err false)))
+      (threshold-yield (/ (* (get baseline-yield yield-policy) 
+                            (get yield-threshold-percent yield-policy)) u100))
+    )
+    (ok (< (get current-yield yield-data) threshold-yield))
+  )
+)
+
+(define-read-only (get-regional-yield-index 
+  (location (string-ascii 100))
+  (crop-type (string-ascii 50))
+  (season uint)
+)
+  (map-get? regional-yield-index { location: location, crop-type: crop-type, season: season })
+)
+
+(define-read-only (get-yield-policy-details (policy-id uint))
+  (map-get? yield-based-policies { policy-id: policy-id })
+)
+
+(define-read-only (calculate-yield-adjusted-premium 
+  (base-premium uint)
+  (location (string-ascii 100))
+  (crop-type (string-ascii 50))
+  (season uint)
+)
+  (match (map-get? regional-yield-index 
+    { location: location, crop-type: crop-type, season: season })
+    yield-data
+      (let
+        (
+          (volatility-factor (/ (get yield-variance yield-data) u10))
+          (adjustment (/ (* base-premium volatility-factor) u100))
+        )
+        (ok (+ base-premium adjustment))
+      )
+    (ok base-premium)
+  )
 )
