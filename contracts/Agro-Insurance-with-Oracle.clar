@@ -21,6 +21,14 @@
 (define-constant LOYALTY_TIER_SILVER u600)
 (define-constant LOYALTY_TIER_GOLD u800)
 
+(define-constant ERR_BUNDLE_NOT_FOUND (err u116))
+(define-constant ERR_BUNDLE_LOCATION_NOT_FOUND (err u117))
+(define-constant ERR_MAX_BUNDLE_LOCATIONS_EXCEEDED (err u118))
+(define-constant ERR_BUNDLE_LOCATION_ALREADY_CLAIMED (err u119))
+(define-constant MAX_BUNDLE_LOCATIONS u5)
+(define-constant MIN_DIVERSIFICATION_DISCOUNT u10)
+(define-constant MAX_DIVERSIFICATION_DISCOUNT u20)
+
 (define-constant ERR_INVALID_YIELD_DATA (err u114))
 (define-constant ERR_YIELD_THRESHOLD_NOT_MET (err u115))
 (define-constant MIN_YIELD_THRESHOLD u50)
@@ -158,48 +166,6 @@
   )
 )
 
-(define-public (claim-insurance (policy-id uint))
-  (let
-    (
-      (policy (unwrap! (map-get? policies { policy-id: policy-id }) ERR_POLICY_NOT_FOUND))
-      (current-block stacks-block-height)
-    )
-    (asserts! (is-eq (get farmer policy) tx-sender) ERR_UNAUTHORIZED)
-    (asserts! (get active policy) ERR_POLICY_NOT_FOUND)
-    (asserts! (<= current-block (get end-block policy)) ERR_POLICY_EXPIRED)
-    (asserts! (not (get claimed policy)) ERR_POLICY_ALREADY_CLAIMED)
-    (asserts! (>= (var-get insurance-pool) (get coverage-amount policy)) ERR_INSUFFICIENT_POOL_FUNDS)
-    
-    (let
-      (
-        (weather-conditions (check-claim-conditions policy-id))
-      )
-      (asserts! weather-conditions ERR_CLAIM_CONDITIONS_NOT_MET)
-      (try! (as-contract (stx-transfer? (get coverage-amount policy) tx-sender (get farmer policy))))
-      (var-set insurance-pool (- (var-get insurance-pool) (get coverage-amount policy)))
-      (map-set policies
-        { policy-id: policy-id }
-        (merge policy { claimed: true, active: false })
-      )
-      (ok (get coverage-amount policy))
-    )
-  )
-)
-
-(define-private (check-claim-conditions (policy-id uint))
-  (let
-    (
-      (policy (unwrap! (map-get? policies { policy-id: policy-id }) false))
-      (location (get location policy))
-      (min-rainfall (get min-rainfall policy))
-      (max-temp (get max-temperature policy))
-      (start-block (get start-block policy))
-      (end-block (get end-block policy))
-    )
-    (check-weather-conditions location min-rainfall max-temp start-block end-block)
-  )
-)
-
 (define-private (check-weather-conditions 
   (location (string-ascii 100))
   (min-rainfall uint)
@@ -235,6 +201,48 @@
         )
         false
       )
+    )
+  )
+)
+
+(define-private (check-claim-conditions (policy-id uint))
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) false))
+      (location (get location policy))
+      (min-rainfall (get min-rainfall policy))
+      (max-temp (get max-temperature policy))
+      (start-block (get start-block policy))
+      (end-block (get end-block policy))
+    )
+    (check-weather-conditions location min-rainfall max-temp start-block end-block)
+  )
+)
+
+(define-public (claim-insurance (policy-id uint))
+  (let
+    (
+      (policy (unwrap! (map-get? policies { policy-id: policy-id }) ERR_POLICY_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq (get farmer policy) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (get active policy) ERR_POLICY_NOT_FOUND)
+    (asserts! (<= current-block (get end-block policy)) ERR_POLICY_EXPIRED)
+    (asserts! (not (get claimed policy)) ERR_POLICY_ALREADY_CLAIMED)
+    (asserts! (>= (var-get insurance-pool) (get coverage-amount policy)) ERR_INSUFFICIENT_POOL_FUNDS)
+    
+    (let
+      (
+        (weather-conditions (check-claim-conditions policy-id))
+      )
+      (asserts! weather-conditions ERR_CLAIM_CONDITIONS_NOT_MET)
+      (try! (as-contract (stx-transfer? (get coverage-amount policy) tx-sender (get farmer policy))))
+      (var-set insurance-pool (- (var-get insurance-pool) (get coverage-amount policy)))
+      (map-set policies
+        { policy-id: policy-id }
+        (merge policy { claimed: true, active: false })
+      )
+      (ok (get coverage-amount policy))
     )
   )
 )
@@ -756,5 +764,198 @@
         (ok (+ base-premium adjustment))
       )
     (ok base-premium)
+  )
+)
+
+(define-map bundle-policies
+  { bundle-id: uint }
+  {
+    farmer: principal,
+    total-coverage: uint,
+    total-premium-paid: uint,
+    location-count: uint,
+    diversification-score: uint,
+    start-block: uint,
+    end-block: uint,
+    active: bool,
+    remaining-coverage: uint
+  }
+)
+
+(define-map bundle-locations
+  { bundle-id: uint, location-index: uint }
+  {
+    location: (string-ascii 100),
+    crop-type: (string-ascii 50),
+    allocated-coverage: uint,
+    min-rainfall: uint,
+    max-temperature: uint,
+    claimed: bool
+  }
+)
+
+(define-public (create-bundle-policy
+  (locations (list 5 (string-ascii 100)))
+  (crop-types (list 5 (string-ascii 50)))
+  (coverages (list 5 uint))
+  (min-rainfalls (list 5 uint))
+  (max-temperatures (list 5 uint))
+  (duration-blocks uint)
+)
+  (let
+    (
+      (bundle-id (var-get next-policy-id))
+      (location-count (len locations))
+      (total-coverage (fold + coverages u0))
+      (base-premium (/ (* total-coverage u10) u100))
+      (diversification-score (calculate-diversification-score location-count))
+      (discount-percent (calculate-bundle-discount diversification-score))
+      (final-premium (- base-premium (/ (* base-premium discount-percent) u100)))
+      (current-block stacks-block-height)
+    )
+    (asserts! (<= location-count MAX_BUNDLE_LOCATIONS) ERR_MAX_BUNDLE_LOCATIONS_EXCEEDED)
+    (asserts! (>= (stx-get-balance tx-sender) final-premium) ERR_INSUFFICIENT_PREMIUM)
+    (try! (stx-transfer? final-premium tx-sender (as-contract tx-sender)))
+    
+    (map-set bundle-policies
+      { bundle-id: bundle-id }
+      {
+        farmer: tx-sender,
+        total-coverage: total-coverage,
+        total-premium-paid: final-premium,
+        location-count: location-count,
+        diversification-score: diversification-score,
+        start-block: current-block,
+        end-block: (+ current-block duration-blocks),
+        active: true,
+        remaining-coverage: total-coverage
+      }
+    )
+    
+    (fold store-location-helper 
+      (list 
+        { loc: (unwrap-panic (element-at locations u0)), crop: (unwrap-panic (element-at crop-types u0)), 
+          cov: (unwrap-panic (element-at coverages u0)), rain: (unwrap-panic (element-at min-rainfalls u0)), 
+          temp: (unwrap-panic (element-at max-temperatures u0)), idx: u0 }
+        { loc: (default-to "" (element-at locations u1)), crop: (default-to "" (element-at crop-types u1)), 
+          cov: (default-to u0 (element-at coverages u1)), rain: (default-to u0 (element-at min-rainfalls u1)), 
+          temp: (default-to u0 (element-at max-temperatures u1)), idx: u1 }
+        { loc: (default-to "" (element-at locations u2)), crop: (default-to "" (element-at crop-types u2)), 
+          cov: (default-to u0 (element-at coverages u2)), rain: (default-to u0 (element-at min-rainfalls u2)), 
+          temp: (default-to u0 (element-at max-temperatures u2)), idx: u2 }
+        { loc: (default-to "" (element-at locations u3)), crop: (default-to "" (element-at crop-types u3)), 
+          cov: (default-to u0 (element-at coverages u3)), rain: (default-to u0 (element-at min-rainfalls u3)), 
+          temp: (default-to u0 (element-at max-temperatures u3)), idx: u3 }
+        { loc: (default-to "" (element-at locations u4)), crop: (default-to "" (element-at crop-types u4)), 
+          cov: (default-to u0 (element-at coverages u4)), rain: (default-to u0 (element-at min-rainfalls u4)), 
+          temp: (default-to u0 (element-at max-temperatures u4)), idx: u4 }
+      )
+      { bundle-id: bundle-id, count: location-count }
+    )
+    (var-set insurance-pool (+ (var-get insurance-pool) final-premium))
+    (var-set next-policy-id (+ bundle-id u1))
+    (ok bundle-id)
+  )
+)
+
+(define-private (store-location-helper 
+  (item { loc: (string-ascii 100), crop: (string-ascii 50), cov: uint, rain: uint, temp: uint, idx: uint })
+  (state { bundle-id: uint, count: uint })
+)
+  (begin
+    (if (and (< (get idx item) (get count state)) (> (len (get loc item)) u0))
+      (map-set bundle-locations
+        { bundle-id: (get bundle-id state), location-index: (get idx item) }
+        {
+          location: (get loc item),
+          crop-type: (get crop item),
+          allocated-coverage: (get cov item),
+          min-rainfall: (get rain item),
+          max-temperature: (get temp item),
+          claimed: false
+        }
+      )
+      false
+    )
+    state
+  )
+)
+
+(define-public (claim-bundle-location (bundle-id uint) (location-index uint))
+  (let
+    (
+      (bundle (unwrap! (map-get? bundle-policies { bundle-id: bundle-id }) ERR_BUNDLE_NOT_FOUND))
+      (location-data (unwrap! (map-get? bundle-locations { bundle-id: bundle-id, location-index: location-index }) ERR_BUNDLE_LOCATION_NOT_FOUND))
+      (current-block stacks-block-height)
+    )
+    (asserts! (is-eq (get farmer bundle) tx-sender) ERR_UNAUTHORIZED)
+    (asserts! (get active bundle) ERR_BUNDLE_NOT_FOUND)
+    (asserts! (<= current-block (get end-block bundle)) ERR_POLICY_EXPIRED)
+    (asserts! (not (get claimed location-data)) ERR_BUNDLE_LOCATION_ALREADY_CLAIMED)
+    (asserts! (>= (var-get insurance-pool) (get allocated-coverage location-data)) ERR_INSUFFICIENT_POOL_FUNDS)
+    
+    (let
+      (
+        (weather-conditions (check-weather-conditions 
+          (get location location-data)
+          (get min-rainfall location-data)
+          (get max-temperature location-data)
+          (get start-block bundle)
+          (get end-block bundle)))
+        (payout-amount (get allocated-coverage location-data))
+        (new-remaining (- (get remaining-coverage bundle) payout-amount))
+      )
+      (asserts! weather-conditions ERR_CLAIM_CONDITIONS_NOT_MET)
+      (try! (as-contract (stx-transfer? payout-amount tx-sender (get farmer bundle))))
+      (var-set insurance-pool (- (var-get insurance-pool) payout-amount))
+      
+      (map-set bundle-locations
+        { bundle-id: bundle-id, location-index: location-index }
+        (merge location-data { claimed: true })
+      )
+      
+      (map-set bundle-policies
+        { bundle-id: bundle-id }
+        (merge bundle { remaining-coverage: new-remaining, active: (> new-remaining u0) })
+      )
+      (ok payout-amount)
+    )
+  )
+)
+
+(define-private (calculate-diversification-score (location-count uint))
+  (if (>= location-count u5) u100
+    (if (>= location-count u4) u80
+      (if (>= location-count u3) u60
+        (if (>= location-count u2) u40 u20)
+      )
+    )
+  )
+)
+
+(define-private (calculate-bundle-discount (diversification-score uint))
+  (+ MIN_DIVERSIFICATION_DISCOUNT (/ (* (- diversification-score u20) MAX_DIVERSIFICATION_DISCOUNT) u80))
+)
+
+(define-read-only (get-bundle-policy (bundle-id uint))
+  (map-get? bundle-policies { bundle-id: bundle-id })
+)
+
+(define-read-only (get-bundle-location (bundle-id uint) (location-index uint))
+  (map-get? bundle-locations { bundle-id: bundle-id, location-index: location-index })
+)
+
+(define-read-only (calculate-bundle-savings 
+  (total-coverage uint)
+  (location-count uint)
+)
+  (let
+    (
+      (base-premium (/ (* total-coverage u10) u100))
+      (diversification-score (calculate-diversification-score location-count))
+      (discount-percent (calculate-bundle-discount diversification-score))
+      (savings (/ (* base-premium discount-percent) u100))
+    )
+    (ok { base-premium: base-premium, final-premium: (- base-premium savings), savings: savings, discount-percent: discount-percent })
   )
 )
